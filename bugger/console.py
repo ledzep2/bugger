@@ -3,18 +3,20 @@
 
 """
 import code
-import select
-import socket
-import sys
+import gevent
+from gevent.server import StreamServer
+import sys, os
 
 _stdout = sys.stdout
 _stderr = sys.stderr
+_stdin = sys.stdin
+_raw_input = raw_input
 
 DEBUG_TELNET_OPTIONS = False
 
 #===============================================================================
 # Telnet Protocol Definition
-# 
+#
 # In order to at least "work" with most telnet clients, we need to implement
 # some basic parts of the telnet protocol.  In particular, we need to handle
 # IAC (Interpret As Command) Option specifiers.
@@ -68,7 +70,7 @@ class StreamInteractiveConsole(code.InteractiveConsole):
         self.output_stream = output_stream
         self._asyn_more = 0
         self._byte_buffer = ''
-    
+
     def async_init(self, banner=None, ps1=None, ps2=None):
         """Initialize the interpreter when operating in async mode
 
@@ -93,7 +95,7 @@ class StreamInteractiveConsole(code.InteractiveConsole):
 
         cprt = 'Type "help", "copyright", "credits" or "license" for more information.'
         if banner is None:
-            self.write("Python %s on %s\r\n%s\r\n(%s)\r\n" % 
+            self.write("Python %s on %s\r\n%s\r\n(%s)\r\n" %
                        (sys.version, sys.platform, cprt,
                         self.__class__.__name__))
         else:
@@ -107,7 +109,7 @@ class StreamInteractiveConsole(code.InteractiveConsole):
             bytes = self.input_stream.read()
         encoding = getattr(sys.stdin, 'encoding', None)
         unpushed_bytes = ''.join([self._byte_buffer, bytes])
-        
+
         # split on both \r\n and \n (effectively convert to just \n)
         if not '\n' in unpushed_bytes:
             self._byte_buffer += bytes
@@ -118,7 +120,7 @@ class StreamInteractiveConsole(code.InteractiveConsole):
                 if encoding and not isinstance(line, unicode):
                     line = line.decode(encoding)
                 self._asyn_more = self.push(line)
-            
+
             # only write prompt if we are done with all lines and we did in
             # fact receive a line.  This makes things work out nicer if they
             # can push multiple lines at once (some clients)
@@ -128,7 +130,7 @@ class StreamInteractiveConsole(code.InteractiveConsole):
                 prompt = sys.ps1
             self._byte_buffer = ''
             self.write(prompt)
-    
+
             return bytes
 
     def close(self):
@@ -148,10 +150,10 @@ class StreamInteractiveConsole(code.InteractiveConsole):
 
 class _TelnetStream(object):
     """Wrap raw stream and make console and telnet play nice with each other"""
-    
+
     def __init__(self, stream):
         self.stream = stream
-    
+
     def _handle_telnet_option(self, option_bytes):
         assert len(option_bytes) == 3
         assert option_bytes[0] == chr(TELNET_COMMANDS.IAC)
@@ -162,10 +164,10 @@ class _TelnetStream(object):
             command_description = inverse_command_map.get(command, "Unknown")
             option_description = inverse_options_map.get(option, "Unknown")
             _stdout.write(self.write("TELNET: Command/Option = %s/%s, %s/%s\r\n" % (command, option, command_description, option_description)))
-    
+
     def __getattr__(self, attr):
         return getattr(self.stream, attr)
-    
+
     def sanitize_input(self, data):
         # first, check for any special telnet sequences (IAC = Interpret As Command)
         IAC = chr(TELNET_COMMANDS.IAC)
@@ -179,29 +181,25 @@ class _TelnetStream(object):
                 self._handle_telnet_option(telnet_option_bytes)
             else:
                 break
-        
+
         return data.replace('\r\n', '\n')
 
     def read(self, *args, **kwargs):
         underlying_read = self.stream.read(*args, **kwargs)
         return self.sanitize_input(underlying_read)
-    
+
     def write(self, s):
         # for telnet, convert newlines to always be \r\n
         self.stream.write(s.replace('\r\n', '\n').replace('\n', '\r\n'))
 
-class TelnetInteractiveConsoleServer(object):
-    """Make an interactive console available via telnet which can interact with your app"""
-
+class TelnetGeventConsoleServer(StreamServer):
+    """ Accept only 1 client 'coz we redirected sys.stdxxx """
     def __init__(self, host='0.0.0.0', port=7070, locals=None, select_timeout=5.0):
-        self.host = host
-        self.port = port
         self.select_timeout = select_timeout
         self.locals = locals
-        self.has_exit = False
-        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.client_sockets = {}
+        self._stop = False
+        self.clients = 0
+        StreamServer.__init__(self, (host, port), self.handle_client)
 
     def client_connect(self, client):
         """Called when a client successfully connected to the server
@@ -219,71 +217,50 @@ class TelnetInteractiveConsoleServer(object):
         """
         pass
 
-    def stop(self):
-        """Cleanly shutdown and kill this console session"""
-        self.has_exit = True
+    def full(self):
+        return self.clients >= 1
 
-    def accept_interactions(self):
-        """Accept and interact with clients via telnet
+    def handle_client(self, client, address):
+        self.clients += 1
+        client_console = StreamInteractiveConsole(_TelnetStream(client.makefile('r', 0)),
+                                                  _TelnetStream(client.makefile('w', 0)),
+                                                  self.locals)
+        client_console.async_init()
 
-        This is the main beef of the application and a blocking call.  If you
-        desire to run your telnet session inside of a separate thread, you can
-        do something like the following...
+        # patch a few things
+        sys.stdout = client_console.output_stream
+        sys.stderr = client_console.output_stream
+        sys.stdin = client_console.input_stream
+        raw_input = client_console.raw_input
 
-            >>> # doctest: +SKIP
-            >>> import threading
-            >>> from bugger.console import TelnetInteractiveConsole
-            >>> console = TelnetInteractiveConsole(port=7070)
-            >>> t = threading.Thread(name="Telnet Interactive Session",
-                                     target=console.accept_interactions)
-            >>> # ...
-            >>> console.stop() # this will end the target method and thread
-
-        """
-        self.server_sock.bind((self.host, self.port))
-        self.server_sock.listen(5) # backlog a few connections
-
-        while not self.has_exit:
-            rl = select.select(self.client_sockets.keys() + [self.server_sock], [], [], self.select_timeout)[0]
-            if self.server_sock in rl:
-                rl.remove(self.server_sock) # we process others as normal
-                client, _addr = self.server_sock.accept() # accept the connection
-                client_console = StreamInteractiveConsole(_TelnetStream(client.makefile('r', 0)),
-                                                          _TelnetStream(client.makefile('w', 0)),
-                                                          self.locals)
-                client_console.async_init()
-                self.client_sockets[client] = client_console
-                self.client_connect(client)
-
-            for client in rl:
+        try:
+            while not self._stop:
                 bytes = client.recv(1024)
                 if bytes == '': # client disconnect
-                    self.client_disconnect(client)
-                    client.close()
-                    del self.client_sockets[client]
+                    break
                 else:
-                    client_console = self.client_sockets[client]
                     bytes = client_console.input_stream.sanitize_input(bytes)
                     if len(bytes) == 0:
                         continue
-                    sys.stdout = client_console.output_stream
-                    sys.stderr = client_console.output_stream
                     try:
                         bytes = client_console.async_recv(bytes)
                     except (SystemExit,):
-                        sys.stdout = _stdout
-                        sys.stderr = _stderr
-                        client_console.close()
-                        client.close()
-                        del self.client_sockets[client]
-        
-        # after main loop, ensure that we perform cleanup
-        try:
-            self.server_sock.close()
-        except socket.error:
-            pass
+                        break
+
+        finally:
+            sys.stdout = _stdout
+            sys.stderr = _stderr
+            sys.stdin = _stdin
+            raw_input = _raw_input
+
+            client_console.close()
+            client.close()
+            self.client_disconnect(client)
+
+            self.clients -= 1
+
 
 if __name__ == '__main__':
     print "Starting python telnet server on port 7070"
-    console_server = TelnetInteractiveConsoleServer(host='0.0.0.0', port=7070, locals=locals())
-    console_server.accept_interactions()
+    console_server = TelnetGeventConsoleServer(host='0.0.0.0', port=7070, locals=locals())
+    console_server.serve_forever()
